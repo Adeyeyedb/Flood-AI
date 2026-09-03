@@ -1,3 +1,4 @@
+cat > index.html << 'FLOODAI_EOF_MARKER'
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -9,34 +10,40 @@
   ============================================================================
   FLOODAI DASHBOARD
   ============================================================================
-  Same Firebase-backed pattern as before, now built around two sensors and
-  an on-device ("edge") risk model instead of a server-side one:
+  Firebase-backed dashboard driven by an ESP32 edge node with three sensors:
 
-    - Water level sensor  (ultrasonic / pressure — cm from a reference point)
-    - DHT11                (temperature °C + relative humidity %, rain proxy)
+    - Water flow sensor   (pulse-based — L/min through the channel/drain)
+    - Soil moisture sensor (capacitive, analog — % saturation)
+    - Temperature sensor   (DS18B20 — °C)
+
+  The ESP32 also drives a buzzer + RGB LED locally and computes its own
+  risk score on-device; this page mirrors that same scoring model so the
+  gauge/radar/trend widgets stay in sync with what's physically happening
+  at the sensor node, and reads live values straight from Firebase.
 
   DATABASE SHAPE
   ----------------------------------------------------------------------------
-  /sensors/current           -> { waterLevel, temperature, humidity, timestamp }
+  /sensors/current           -> { flowRate, soilMoisture, temperature, riskScore, timestamp }
   /sensors/history/<pushId>  -> same fields, one per reading, drives the trend
-                                 chart and the on-device rate-of-rise calc
+                                 chart and the "peak flow" stat
 
-  The "AI / edge" framing here is real, just simple by design: the risk
-  score is computed client-side, in this file, the instant a new reading
-  arrives — no round trip to a cloud model. That local computation is what
-  "edge computing" means in a dashboard this size; swap FLOOD_MODEL for a
-  trained model's output later without changing anything else on the page.
-
-  Connect your own project: paste your config into FIREBASE_CONFIG below.
-  Until then this runs in simulation mode, clearly labeled on screen.
+  Connect your own project: paste your config into FIREBASE_CONFIG below —
+  it should match the config baked into your ESP32 sketch. This page talks
+  to Firebase over plain HTTPS REST calls (fetch), not the Firebase JS SDK,
+  so there's no external CDN script that an ad-blocker or firewall can
+  block — it only needs to reach your databaseURL directly, the same host
+  your ESP32 already writes to. If that's unreachable, this runs in
+  simulation mode, clearly labeled on screen.
   ============================================================================
 -->
 
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
-<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
-<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-database-compat.js"></script>
+<!-- No Firebase SDK script tag on purpose — this page talks to the
+     Realtime Database over plain HTTPS REST (fetch), so it isn't exposed
+     to CDN-blocking issues with gstatic.com or similar. See section 4
+     in the script below. -->
 
 <style>
   :root{
@@ -70,8 +77,6 @@
     padding:28px 16px 60px;
   }
 
-  /* faint horizon reflection lines — grounds the backdrop in water without
-     literally illustrating a flood */
   body::before{
     content:"";
     position:fixed; inset:0; z-index:0; pointer-events:none;
@@ -96,7 +101,6 @@
     to{opacity:1; transform:translateY(0);}
   }
 
-  /* ---------- header ---------- */
   .top-row{
     display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:14px;
     padding-bottom:18px; margin-bottom:18px; border-bottom:1px solid var(--glass-border);
@@ -147,7 +151,6 @@
     flex-shrink:0;
   }
 
-  /* ---------- sub header ---------- */
   .sub-row{display:flex; align-items:center; gap:12px; margin-bottom:20px; flex-wrap:wrap;}
   .back{color:var(--ink-dim); font-size:14px;}
   .sub-row h2{font-family:'Space Grotesk',sans-serif; font-size:20px; font-weight:600; margin:0;}
@@ -163,7 +166,6 @@
     padding:4px 10px; border-radius:999px; background:rgba(242,169,59,0.08);
   }
 
-  /* ---------- main grid ---------- */
   .main-grid{display:grid; grid-template-columns:2fr 1fr; gap:16px; margin-bottom:16px;}
   @media (max-width:900px){.main-grid{grid-template-columns:1fr;}}
 
@@ -196,7 +198,6 @@
   .radar-box{flex:1; min-width:220px;}
   #radarChart{max-height:200px;}
 
-  /* right column trend card */
   .trend-card{display:flex; flex-direction:column; height:100%;}
   .trend-headline{display:flex; align-items:baseline; gap:6px; margin-bottom:2px;}
   .trend-headline .n{font-family:'Space Grotesk',sans-serif; font-size:26px; font-weight:700;}
@@ -206,13 +207,12 @@
     border:1px solid rgba(94,230,217,0.4); color:var(--safe); background:rgba(94,230,217,0.08); width:fit-content;
   }
   .tag.rising{border-color:rgba(242,169,59,0.4); color:var(--watch); background:rgba(242,169,59,0.08);}
-  #levelChart{margin-top:14px; max-height:130px;}
+  #flowChart{margin-top:14px; max-height:130px;}
   .view-link{
     margin-top:14px; align-self:flex-start; font-size:12px; color:var(--ink);
     background:var(--glass-card); border:1px solid var(--glass-border); padding:7px 13px; border-radius:999px;
   }
 
-  /* ---------- lower cards row ---------- */
   .cards-row{display:grid; grid-template-columns:1fr 1fr 1fr; gap:16px; margin-bottom:16px;}
   @media (max-width:900px){.cards-row{grid-template-columns:1fr;}}
 
@@ -245,7 +245,6 @@
   .infl-notes{font-size:12px; color:var(--ink-dim); line-height:1.6; padding-left:14px; margin:0;}
   .infl-notes li{margin-bottom:4px;}
 
-  /* ---------- markers section ---------- */
   .markers-card{padding:20px;}
   .markers-head{display:flex; align-items:center; gap:8px; margin-bottom:14px;}
   .markers-head h3{margin:0;}
@@ -268,7 +267,6 @@
   footer{margin-top:6px; text-align:center; font-size:11.5px; color:var(--ink-faint);}
   footer a{color:var(--safe); text-decoration:none;}
 
-  /* ---------- evacuation banner ---------- */
   .evac-banner{
     display:none;
     align-items:center; gap:16px; flex-wrap:wrap;
@@ -300,7 +298,6 @@
   .evac-status{font-size:11px; color:var(--ink-faint);}
   .evac-status.sent{color:var(--danger);}
 
-  /* ---------- safe place card ---------- */
   .safe-card{margin-bottom:16px;}
   .safe-row{display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:16px;}
   .safe-place{display:flex; align-items:center; gap:14px;}
@@ -365,7 +362,7 @@
       </div>
       <div class="evac-body">
         <h4>Evacuation signal active</h4>
-        <p id="evacText">Water level and rise rate exceed the danger threshold. Move to the nearest safe place listed below.</p>
+        <p id="evacText">Water flow and soil saturation exceed the danger threshold. Move to the nearest safe place listed below.</p>
       </div>
       <div class="evac-actions">
         <span class="evac-status sent" id="evacStatus">Signal sent — 0 devices notified</span>
@@ -396,7 +393,7 @@
     <div class="main-grid">
       <div class="card">
         <h3>Flood Risk Index</h3>
-        <p class="desc">On-device inference combining current water level, rate of rise, and humidity to estimate flood probability in the next 6 hours.</p>
+        <p class="desc">On-device inference combining water flow rate, soil moisture, and temperature to estimate flood probability in the next 6 hours.</p>
 
         <div class="gauge-wrap">
           <div class="gauge-box">
@@ -408,10 +405,10 @@
               <div class="gauge-pct" id="gaugePct" style="color:var(--watch);">—</div>
               <div class="gauge-sub">probability, next 6h</div>
             </div>
-            <div class="orbit-stat os-1"><div class="v" id="osLevel">—</div><div class="l">Water level</div></div>
-            <div class="orbit-stat os-2"><div class="v" id="osRise">—</div><div class="l">Rate of rise</div></div>
-            <div class="orbit-stat os-3"><div class="v" id="osHum">—</div><div class="l">Humidity</div></div>
-            <div class="orbit-stat os-4"><div class="v" id="osTemp">—</div><div class="l">Temperature</div></div>
+            <div class="orbit-stat os-1"><div class="v" id="osFlow">—</div><div class="l">Flow rate</div></div>
+            <div class="orbit-stat os-2"><div class="v" id="osSoil">—</div><div class="l">Soil moisture</div></div>
+            <div class="orbit-stat os-3"><div class="v" id="osTemp">—</div><div class="l">Temperature</div></div>
+            <div class="orbit-stat os-4"><div class="v" id="osPeak">—</div><div class="l">Peak flow 24h</div></div>
           </div>
 
           <div class="radar-box">
@@ -421,11 +418,11 @@
       </div>
 
       <div class="card trend-card">
-        <h3>Water Level Trend</h3>
-        <p class="desc" style="margin-bottom:8px;">Live readings from the gauge sensor.</p>
-        <div class="trend-headline"><span class="n" id="levelNow">—</span><span class="u">cm</span></div>
-        <span class="tag" id="levelTag">Stable</span>
-        <canvas id="levelChart"></canvas>
+        <h3>Water Flow Trend</h3>
+        <p class="desc" style="margin-bottom:8px;">Live readings from the flow sensor.</p>
+        <div class="trend-headline"><span class="n" id="flowNow">—</span><span class="u">L/min</span></div>
+        <span class="tag" id="flowTag">Stable</span>
+        <canvas id="flowChart"></canvas>
         <div class="view-link">View full report</div>
       </div>
     </div>
@@ -433,7 +430,7 @@
     <div class="cards-row">
       <div class="card">
         <h3>AI Prediction Score <span style="float:right;"><span class="ai-badge">edge</span></span></h3>
-        <p class="desc">Computed locally the instant a new reading arrives — no cloud round trip.</p>
+        <p class="desc">Computed locally on the ESP32 the instant a new reading arrives — no cloud round trip.</p>
         <div class="score-row">
           <div class="score-num" id="scoreNum">— <small>/ 100</small></div>
           <div class="score-base">Baseline <b>18</b> · Moderate risk band</div>
@@ -446,22 +443,21 @@
       <div class="card">
         <h3>Sensor Readings</h3>
         <p class="desc">Live values against normal operating range.</p>
-        <div class="reading-row"><span class="rname">Water level<span class="rrange">Normal &lt; 40 cm</span></span><span class="rval" id="rowLevel">—</span></div>
-        <div class="reading-row"><span class="rname">Rate of rise<span class="rrange">Normal &lt; 2 cm/hr</span></span><span class="rval" id="rowRise">—</span></div>
-        <div class="reading-row"><span class="rname">Temperature<span class="rrange">DHT11, ambient</span></span><span class="rval" id="rowTemp">—</span></div>
-        <div class="reading-row"><span class="rname">Humidity<span class="rrange">Normal &lt; 80%</span></span><span class="rval" id="rowHum">—</span></div>
+        <div class="reading-row"><span class="rname">Water flow<span class="rrange">Normal &lt; 5 L/min</span></span><span class="rval" id="rowFlow">—</span></div>
+        <div class="reading-row"><span class="rname">Soil moisture<span class="rrange">Normal &lt; 60%</span></span><span class="rval" id="rowSoil">—</span></div>
+        <div class="reading-row"><span class="rname">Temperature<span class="rrange">DS18B20</span></span><span class="rval" id="rowTemp">—</span></div>
       </div>
 
       <div class="card">
-        <h3>Rainfall &amp; Humidity Trend</h3>
+        <h3>Soil Saturation Trend</h3>
         <div class="infl-top">
-          <div class="infl-metric"><div class="v" id="humPct">—</div><div class="l">Current humidity</div></div>
-          <div class="infl-metric right"><div class="v" id="humPctile">—</div><div class="l">vs seasonal norm</div></div>
+          <div class="infl-metric"><div class="v" id="soilPct">—</div><div class="l">Current soil moisture</div></div>
+          <div class="infl-metric right"><div class="v" id="soilPctile">—</div><div class="l">vs seasonal norm</div></div>
         </div>
-        <div class="change-row">Change over 24h: <b id="humChange">—</b></div>
+        <div class="change-row">Change over 24h: <b id="soilChange">—</b></div>
         <ul class="infl-notes">
-          <li>Sustained humidity above 85% suggests active or recent rainfall upstream.</li>
-          <li>Combined with a rising water level, this raises confidence in the risk score above.</li>
+          <li>Soil moisture above 75% suggests the ground is saturated and can't absorb much more rain.</li>
+          <li>Combined with a rising flow rate, this raises confidence in the risk score above.</li>
         </ul>
       </div>
     </div>
@@ -470,17 +466,17 @@
       <div class="markers-head"><h3>Edge AI Markers</h3><span class="ai-badge">on-device</span></div>
       <div class="markers-grid">
         <div>
-          <div class="marker-group-title"><span class="sw" style="background:var(--watch);"></span>Water level patterns</div>
-          <ul class="marker-list" id="markersLevel"></ul>
+          <div class="marker-group-title"><span class="sw" style="background:var(--watch);"></span>Water flow patterns</div>
+          <ul class="marker-list" id="markersFlow"></ul>
         </div>
         <div>
-          <div class="marker-group-title"><span class="sw" style="background:#8FD8FF;"></span>Atmospheric patterns</div>
-          <ul class="marker-list" id="markersAtmo"></ul>
+          <div class="marker-group-title"><span class="sw" style="background:#8FD8FF;"></span>Soil &amp; temperature patterns</div>
+          <ul class="marker-list" id="markersEnv"></ul>
         </div>
       </div>
     </div>
 
-    <footer>Thresholds and model weights are set in <code>FLOOD_MODEL</code> in the page source — calibrate to your gauge point. · Last sync: <span id="lastSync">—</span></footer>
+    <footer>Thresholds and model weights are set in <code>FLOOD_MODEL</code> in the page source — keep them matched to the thresholds in the ESP32 sketch. · Last sync: <span id="lastSync">—</span></footer>
   </div>
 </div>
 
@@ -488,27 +484,29 @@
 /* ============================================================================
    1. CONFIGURATION
    ============================================================================ */
+
 const FIREBASE_CONFIG = {
-  apiKey: "YOUR_API_KEY",
-  authDomain: "YOUR_PROJECT.firebaseapp.com",
-  databaseURL: "https://YOUR_PROJECT-default-rtdb.firebaseio.com",
-  projectId: "YOUR_PROJECT",
+  apiKey: "AIzaSyDEVuVwHJdjJmy-PRL2wgf1lAoIzKhKVmw",
+  authDomain: "floodai-a4646.firebaseapp.com",
+  databaseURL: "https://floodai-a4646-default-rtdb.firebaseio.com",
+  projectId: "floodai-a4646",
+  storageBucket: "floodai-a4646.firebasestorage.app",
+  messagingSenderId: "1086937849989",
+  appId: "1:1086937849989:web:aa31ed8fe4e595ee9949ec",
+  measurementId: "G-TTKRZ6RCTV"
 };
 
-// Edge inference model: thresholds + weights, tuned to your gauge point.
+// Edge inference model — mirror the ESP32 sketch's thresholds so the
+// dashboard's score matches what the device itself computed.
 const FLOOD_MODEL = {
-  waterLevel: { watch: 40, warning: 70, danger: 100 },   // cm
-  rateOfRise: { watch: 2, warning: 5, danger: 10 },       // cm/hr
-  humidity:   { watch: 80, warning: 90, danger: 96 },     // % RH
-  weights:    { waterLevel: 0.55, rateOfRise: 0.30, humidity: 0.15 },
+  flowRate:     { watch: 5,  warning: 10, danger: 15 },  // L/min
+  soilMoisture: { watch: 60, warning: 75, danger: 90 },  // % saturation
+  temperature:  { watch: 30, warning: 34, danger: 38 },  // °C
+  weights:      { flowRate: 0.50, soilMoisture: 0.35, temperature: 0.15 },
 };
 
 const HISTORY_POINTS = 24;
 
-// Gauge station location, and known safe places (shelters, high ground,
-// evacuation centers) near it. Replace with real coordinates for your site —
-// get them by right-clicking the spot in Google Maps and copying the
-// lat/lng shown. Add as many entries as you have.
 const STATION_COORDS = { lat: 6.5244, lng: 3.3792 }; // TODO: your gauge point
 
 const SAFE_ZONES = [
@@ -517,24 +515,25 @@ const SAFE_ZONES = [
   { name: "TODO: Health Center",      lat: 6.5320, lng: 3.3650, note: "First aid available" },
 ];
 
-// Trigger the evacuation signal at this risk band or above.
 const EVACUATION_TRIGGER_BAND = "DANGER";
 
 /* ============================================================================
    2. STATE + CHARTS
    ============================================================================ */
 let currentBand = "SAFE";
-let simState = { waterLevel: 18, temperature: 27, humidity: 58, prevLevel: 18 };
-let simStep = null;
-let simIntervalId = null;
+let previousFlow = null;
+let simState = { flowRate: 1.5, temperature: 27, soilMoisture: 35 };
+let tickFn = null;          // whichever function (sim tick or REST poll) is currently active
+let liveIntervalId = null;
+const POLL_INTERVAL_MS = 3000;
 
 const radarCtx = document.getElementById('radarChart').getContext('2d');
 const radarChart = new Chart(radarCtx, {
   type: 'radar',
   data: {
-    labels: ['Water level', 'Rate of rise', 'Humidity', 'Temp volatility', 'Historical deviation'],
+    labels: ['Flow rate', 'Soil moisture', 'Temperature', 'Historical deviation'],
     datasets: [{
-      data: [10,10,10,10,10],
+      data: [10,10,10,10],
       backgroundColor: 'rgba(94,230,217,0.15)',
       borderColor: '#5EE6D9',
       pointBackgroundColor: '#5EE6D9',
@@ -554,8 +553,8 @@ const radarChart = new Chart(radarCtx, {
   }
 });
 
-const levelCtx = document.getElementById('levelChart').getContext('2d');
-const levelChart = new Chart(levelCtx, {
+const flowCtx = document.getElementById('flowChart').getContext('2d');
+const flowChart = new Chart(flowCtx, {
   type:'line',
   data:{ labels:[], datasets:[{ data:[], borderColor:'#5EE6D9', backgroundColor:'rgba(94,230,217,0.12)', borderWidth:2, pointRadius:0, tension:0.35, fill:true }] },
   options:{
@@ -573,9 +572,9 @@ function norm(v, t){ return Math.min(1, Math.max(0, v / t.danger)); }
 function computeRisk(d){
   const m = FLOOD_MODEL;
   const score = 100 * (
-    m.weights.waterLevel  * norm(d.waterLevel, m.waterLevel) +
-    m.weights.rateOfRise  * norm(d.rateOfRise, m.rateOfRise) +
-    m.weights.humidity    * norm(d.humidity, m.humidity)
+    m.weights.flowRate     * norm(d.flowRate, m.flowRate) +
+    m.weights.soilMoisture * norm(d.soilMoisture, m.soilMoisture) +
+    m.weights.temperature  * norm(d.temperature, m.temperature)
   );
   return Math.round(Math.min(100, score));
 }
@@ -587,22 +586,22 @@ function bandFor(score){
   return { name:'SAFE', color:'var(--safe)', pill:'safe', label:'Normal' };
 }
 
+let recentHistory = [];
+
 function render(d){
-  const score = computeRisk(d);
+  // Prefer the device's own edge score if it was sent; otherwise compute it here.
+  const score = (typeof d.riskScore === 'number') ? d.riskScore : computeRisk(d);
   const band = bandFor(score);
 
-  // header chips
   document.getElementById('chipRisk').textContent = score;
   document.getElementById('chipRisk').parentElement.querySelector('.num').style.color = band.color;
   const deltaX = (score / 22).toFixed(1);
   document.getElementById('chipDelta').textContent = deltaX + 'x';
 
-  // status pill
   const pill = document.getElementById('statusPill');
   pill.className = 'status-pill ' + band.pill;
   pill.textContent = band.label;
 
-  // gauge
   const pctOfCircle = 377 - (377 * score / 100);
   document.getElementById('gaugeArc').setAttribute('stroke-dashoffset', pctOfCircle);
   document.getElementById('gaugeArc').style.stroke = band.color;
@@ -610,46 +609,41 @@ function render(d){
   gaugePct.textContent = score + '%';
   gaugePct.style.color = band.color;
 
-  document.getElementById('osLevel').textContent = Math.round(d.waterLevel) + ' cm';
-  document.getElementById('osRise').textContent = d.rateOfRise.toFixed(1) + ' cm/hr';
-  document.getElementById('osHum').textContent = Math.round(d.humidity) + '%';
+  document.getElementById('osFlow').textContent = d.flowRate.toFixed(1) + ' L/min';
+  document.getElementById('osSoil').textContent = Math.round(d.soilMoisture) + '%';
   document.getElementById('osTemp').textContent = d.temperature.toFixed(1) + '°C';
+  const peakFlow = recentHistory.length ? Math.max(...recentHistory.map(p => p.flowRate)) : d.flowRate;
+  document.getElementById('osPeak').textContent = peakFlow.toFixed(1) + ' L/min';
 
-  // radar
   radarChart.data.datasets[0].data = [
-    Math.round(norm(d.waterLevel, FLOOD_MODEL.waterLevel)*100),
-    Math.round(norm(d.rateOfRise, FLOOD_MODEL.rateOfRise)*100),
-    Math.round(norm(d.humidity, FLOOD_MODEL.humidity)*100),
-    Math.min(100, Math.round(Math.abs(d.temperature-27)*8)),
+    Math.round(norm(d.flowRate, FLOOD_MODEL.flowRate)*100),
+    Math.round(norm(d.soilMoisture, FLOOD_MODEL.soilMoisture)*100),
+    Math.round(norm(d.temperature, FLOOD_MODEL.temperature)*100),
     Math.min(100, Math.round(score*0.9)),
   ];
   radarChart.update();
 
-  // trend card
-  document.getElementById('levelNow').textContent = Math.round(d.waterLevel);
-  const levelTag = document.getElementById('levelTag');
-  if (d.rateOfRise > FLOOD_MODEL.rateOfRise.watch){
-    levelTag.textContent = 'Rising'; levelTag.className = 'tag rising';
+  document.getElementById('flowNow').textContent = d.flowRate.toFixed(1);
+  const flowTag = document.getElementById('flowTag');
+  const delta = previousFlow === null ? 0 : d.flowRate - previousFlow;
+  if (delta > 0.5 || d.flowRate > FLOOD_MODEL.flowRate.watch){
+    flowTag.textContent = 'Rising'; flowTag.className = 'tag rising';
   } else {
-    levelTag.textContent = 'Stable'; levelTag.className = 'tag';
+    flowTag.textContent = 'Stable'; flowTag.className = 'tag';
   }
+  previousFlow = d.flowRate;
 
-  // prediction score card
   document.getElementById('scoreNum').innerHTML = score + ' <small>/ 100</small>';
   document.getElementById('scoreBar').style.width = Math.max(4, score) + '%';
 
-  // readings list
-  document.getElementById('rowLevel').textContent = Math.round(d.waterLevel) + ' cm';
-  document.getElementById('rowRise').textContent = d.rateOfRise.toFixed(1) + ' cm/hr';
+  document.getElementById('rowFlow').textContent = d.flowRate.toFixed(1) + ' L/min';
+  document.getElementById('rowSoil').textContent = Math.round(d.soilMoisture) + ' %';
   document.getElementById('rowTemp').textContent = d.temperature.toFixed(1) + ' °C';
-  document.getElementById('rowHum').textContent = Math.round(d.humidity) + ' %';
 
-  // humidity card
-  document.getElementById('humPct').textContent = Math.round(d.humidity) + '%';
-  document.getElementById('humPctile').textContent = Math.round(norm(d.humidity, FLOOD_MODEL.humidity)*100) + 'th';
-  document.getElementById('humChange').textContent = (d.humidity > 75 ? '+' : '') + (d.humidity - 60).toFixed(0) + ' pts';
+  document.getElementById('soilPct').textContent = Math.round(d.soilMoisture) + '%';
+  document.getElementById('soilPctile').textContent = Math.round(norm(d.soilMoisture, FLOOD_MODEL.soilMoisture)*100) + 'th';
+  document.getElementById('soilChange').textContent = (d.soilMoisture > 40 ? '+' : '') + (d.soilMoisture - 35).toFixed(0) + ' pts';
 
-  // markers
   renderMarkers(d, score);
 
   document.getElementById('lastSync').textContent = new Date(d.timestamp || Date.now()).toLocaleTimeString();
@@ -706,26 +700,28 @@ function sendEvacuationSignal(d){
   evacuationSent = true;
   document.getElementById('evacBanner').classList.add('live');
   document.getElementById('evacText').textContent =
-    `Water level ${Math.round(d.waterLevel)} cm, rising ${d.rateOfRise.toFixed(1)} cm/hr — this exceeds the danger threshold. Move to the nearest safe place now.`;
+    `Water flow ${d.flowRate.toFixed(1)} L/min and soil moisture ${Math.round(d.soilMoisture)}% exceed the danger threshold. Move to the nearest safe place now.`;
   showSafeCard();
   playSiren();
 
-  // Write the signal to Firebase so any subscribed system (SMS gateway,
-  // push notifications, physical sirens) can act on it. This page only
-  // raises the flag — dispatching it to real devices needs a small backend
-  // (see functions/index.js) listening on this same path.
-  try{
-    if (firebase.apps && firebase.apps.length){
-      firebase.database().ref('evacuation/current').set({
+  // Write the signal to Firebase via the REST API so any subscribed system
+  // (SMS gateway, push notifications, physical sirens) can act on it. This
+  // is a plain HTTPS PUT — no SDK involved, so it works even if the SDK's
+  // CDN mirrors were blocked earlier in the page load.
+  if (looksConfigured(FIREBASE_CONFIG)){
+    fetch(FIREBASE_CONFIG.databaseURL + '/evacuation/current.json', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
         active: true,
         level: currentBand,
-        waterLevel: d.waterLevel,
-        rateOfRise: d.rateOfRise,
+        flowRate: d.flowRate,
+        soilMoisture: d.soilMoisture,
         nearestSafeZone: nearestSafeZone()[0].name,
         timestamp: Date.now(),
-      });
-    }
-  } catch(e){ console.warn('Evacuation signal not written to Firebase (offline/simulation):', e); }
+      }),
+    }).catch(e => console.warn('Evacuation signal not written to Firebase:', e));
+  }
 
   document.getElementById('evacStatus').textContent = 'Signal sent — dispatch pending backend';
 }
@@ -753,15 +749,15 @@ let liveUpdatesOn = true;
 document.getElementById('liveToggle').addEventListener('click', (e) => {
   liveUpdatesOn = !liveUpdatesOn;
   e.currentTarget.classList.toggle('off', !liveUpdatesOn);
-  if (!liveUpdatesOn && simIntervalId){ clearInterval(simIntervalId); simIntervalId = null; }
-  else if (liveUpdatesOn && !looksConfigured(FIREBASE_CONFIG) && !simIntervalId){ simIntervalId = setInterval(simStep, 3000); }
+  if (!liveUpdatesOn && liveIntervalId){ clearInterval(liveIntervalId); liveIntervalId = null; }
+  else if (liveUpdatesOn && tickFn && !liveIntervalId){ liveIntervalId = setInterval(tickFn, POLL_INTERVAL_MS); }
 });
 document.getElementById('refreshBtn').addEventListener('click', () => {
-  if (!looksConfigured(FIREBASE_CONFIG)) simStep();
+  if (tickFn) tickFn();
 });
 document.getElementById('exportBtn').addEventListener('click', () => {
-  const rows = levelChart.data.labels.map((t,i) => `${t},${levelChart.data.datasets[0].data[i]}`);
-  const csv = "time,water_level_cm\n" + rows.join("\n");
+  const rows = flowChart.data.labels.map((t,i) => `${t},${flowChart.data.datasets[0].data[i]}`);
+  const csv = "time,flow_rate_lpm\n" + rows.join("\n");
   const blob = new Blob([csv], { type: 'text/csv' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
@@ -770,88 +766,118 @@ document.getElementById('exportBtn').addEventListener('click', () => {
 });
 
 function renderMarkers(d, score){
-  const level = [];
-  const atmo = [];
+  const flow = [];
+  const env = [];
 
-  level.push({ n:'Water level vs baseline', v: (d.waterLevel > 30 ? '+' : '') + Math.round(d.waterLevel - 18) + ' cm' });
-  level.push({ n:'Rate-of-rise pattern', v: d.rateOfRise > FLOOD_MODEL.rateOfRise.watch ? 'Rapid rise' : 'Normal' });
-  level.push({ n:'Diurnal deviation', v: score > 50 ? 'Above expected' : 'Within range' });
+  flow.push({ n:'Flow vs baseline', v: (d.flowRate > 2 ? '+' : '') + (d.flowRate - 1.5).toFixed(1) + ' L/min' });
+  flow.push({ n:'Flow trend pattern', v: d.flowRate > FLOOD_MODEL.flowRate.watch ? 'Rapid rise' : 'Normal' });
+  flow.push({ n:'Historical deviation', v: score > 50 ? 'Above expected' : 'Within range' });
 
-  atmo.push({ n:'Humidity trend', v: d.humidity > 85 ? 'Sustained high' : 'Normal' });
-  atmo.push({ n:'Temp–humidity coupling', v: (d.humidity > 85 && d.temperature < 26) ? 'Storm-consistent' : 'No signal' });
-  atmo.push({ n:'Sensor confidence', v: 'High' });
+  env.push({ n:'Soil saturation trend', v: d.soilMoisture > 75 ? 'Near saturated' : 'Normal' });
+  env.push({ n:'Temp–moisture coupling', v: (d.soilMoisture > 75 && d.temperature < 26) ? 'Storm-consistent' : 'No signal' });
+  env.push({ n:'Sensor confidence', v: 'High' });
 
-  document.getElementById('markersLevel').innerHTML = level.map(m => `<li><span class="mname">${m.n}</span><span class="mval">${m.v}</span></li>`).join('');
-  document.getElementById('markersAtmo').innerHTML = atmo.map(m => `<li><span class="mname">${m.n}</span><span class="mval">${m.v}</span></li>`).join('');
+  document.getElementById('markersFlow').innerHTML = flow.map(m => `<li><span class="mname">${m.n}</span><span class="mval">${m.v}</span></li>`).join('');
+  document.getElementById('markersEnv').innerHTML = env.map(m => `<li><span class="mname">${m.n}</span><span class="mval">${m.v}</span></li>`).join('');
 }
 
-function renderLevelChart(history){
+function renderFlowChart(history){
   const points = history.slice(-HISTORY_POINTS);
-  levelChart.data.labels = points.map(p => new Date(p.timestamp).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}));
-  levelChart.data.datasets[0].data = points.map(p => p.waterLevel);
-  levelChart.update();
+  recentHistory = points;
+  flowChart.data.labels = points.map(p => new Date(p.timestamp).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}));
+  flowChart.data.datasets[0].data = points.map(p => p.flowRate);
+  flowChart.update();
 }
 
 /* ============================================================================
-   4. SIMULATION / FIREBASE WIRING
-   ============================================================================ */
+   4. SIMULATION / FIREBASE WIRING (plain REST — no SDK, no CDN dependency)
+   ============================================================================
+   Realtime Database exposes every path as a plain HTTPS endpoint:
+   GET  https://<db>.firebaseio.com/sensors/current.json
+   This talks to the exact same host your ESP32 already writes to, so if the
+   device's writes are working, this will work too — no external script tag
+   to be blocked by an ad-blocker or firewall.                              */
 function rand(a,b){ return a + Math.random()*(b-a); }
 function clamp(v,a,b){ return Math.max(a, Math.min(b, v)); }
 function looksConfigured(cfg){ return cfg.apiKey && !cfg.apiKey.startsWith('YOUR_') && cfg.databaseURL && !cfg.databaseURL.includes('YOUR_PROJECT'); }
 
 function startSimulation(){
   document.getElementById('simTag').style.display = 'inline-block';
+  document.getElementById('simTag').textContent = 'Simulated data';
+  document.getElementById('simTag').title = '';
   const history = [];
-  simStep = function(){
+  tickFn = function(){
     const storm = Math.random() < 0.07;
-    const prevLevel = simState.waterLevel;
-    simState.waterLevel = clamp(simState.waterLevel + (storm ? rand(4,10) : rand(-1,1.2)), 2, 130);
-    simState.humidity = clamp(simState.humidity + (storm ? rand(3,8) : rand(-2,2)), 40, 99);
+    simState.flowRate = clamp(simState.flowRate + (storm ? rand(2,6) : rand(-0.5,0.5)), 0, 25);
+    simState.soilMoisture = clamp(simState.soilMoisture + (storm ? rand(3,8) : rand(-2,2)), 10, 99);
     simState.temperature = clamp(simState.temperature + rand(-0.3,0.3), 22, 34);
-    const rateOfRise = (simState.waterLevel - prevLevel) * 20; // scale demo tick to cm/hr
 
-    const reading = { waterLevel: simState.waterLevel, rateOfRise: Math.max(0, rateOfRise), temperature: simState.temperature, humidity: simState.humidity, timestamp: Date.now() };
+    const reading = { flowRate: simState.flowRate, soilMoisture: simState.soilMoisture, temperature: simState.temperature, timestamp: Date.now() };
+    reading.riskScore = computeRisk(reading);
     history.push(reading);
     if (history.length > HISTORY_POINTS) history.shift();
 
     render(reading);
-    renderLevelChart(history);
+    renderFlowChart(history);
   };
-  simStep();
-  simIntervalId = setInterval(simStep, 3000);
+  tickFn();
+  liveIntervalId = setInterval(tickFn, POLL_INTERVAL_MS);
 }
 
-function startFirebase(){
-  try{
-    firebase.initializeApp(FIREBASE_CONFIG);
-    const db = firebase.database();
-    document.getElementById('simTag').style.display = 'none';
+async function fetchJSON(path){
+  const res = await fetch(FIREBASE_CONFIG.databaseURL + path, { cache: 'no-store' });
+  if (!res.ok) throw new Error('HTTP ' + res.status + ' for ' + path);
+  return res.json();
+}
 
-    let lastLevel = null, lastTs = null;
-    db.ref('sensors/current').on('value', snap => {
-      const d = snap.val();
-      if (!d) return;
-      let rateOfRise = 0;
-      if (lastLevel !== null && lastTs !== null){
-        const hrs = (d.timestamp - lastTs) / 3600000;
-        if (hrs > 0) rateOfRise = Math.max(0, (d.waterLevel - lastLevel) / hrs);
-      }
-      lastLevel = d.waterLevel; lastTs = d.timestamp;
-      render({ ...d, rateOfRise });
-    }, err => { console.error('Firebase read failed, falling back to simulation:', err); startSimulation(); });
+function startLive(){
+  let usingFallback = false;
+  const fallbackHistory = [];
 
-    db.ref('sensors/history').limitToLast(HISTORY_POINTS).on('value', snap => {
-      const val = snap.val();
-      if (!val) return;
-      renderLevelChart(Object.values(val).sort((a,b) => a.timestamp - b.timestamp));
-    });
-  } catch(err){
-    console.error('Firebase init failed, running simulation instead:', err);
-    startSimulation();
+  function showFallback(reason){
+    if (!usingFallback){
+      usingFallback = true;
+      document.getElementById('simTag').style.display = 'inline-block';
+    }
+    document.getElementById('simTag').textContent = 'Firebase unreachable — retrying automatically';
+    document.getElementById('simTag').title = reason + ' Test ' + FIREBASE_CONFIG.databaseURL + '/sensors/current.json directly in a new browser tab — if that also fails to load, it confirms this device/network can\'t reach Firebase right now. Showing simulated data meanwhile; this page keeps retrying every ' + (POLL_INTERVAL_MS/1000) + 's and will switch back to live data automatically the moment a request succeeds.';
+
+    const storm = Math.random() < 0.07;
+    simState.flowRate = clamp(simState.flowRate + (storm ? rand(2,6) : rand(-0.5,0.5)), 0, 25);
+    simState.soilMoisture = clamp(simState.soilMoisture + (storm ? rand(3,8) : rand(-2,2)), 10, 99);
+    simState.temperature = clamp(simState.temperature + rand(-0.3,0.3), 22, 34);
+    const reading = { flowRate: simState.flowRate, soilMoisture: simState.soilMoisture, temperature: simState.temperature, timestamp: Date.now() };
+    reading.riskScore = computeRisk(reading);
+    fallbackHistory.push(reading);
+    if (fallbackHistory.length > HISTORY_POINTS) fallbackHistory.shift();
+    render(reading);
+    renderFlowChart(fallbackHistory);
   }
+
+  tickFn = async function(){
+    try{
+      const [current, history] = await Promise.all([
+        fetchJSON('/sensors/current.json'),
+        fetchJSON('/sensors/history.json?orderBy=%22timestamp%22&limitToLast=' + HISTORY_POINTS),
+      ]);
+      if (usingFallback){
+        usingFallback = false;
+        document.getElementById('simTag').style.display = 'none';
+        document.getElementById('simTag').title = '';
+      }
+      if (current) render(current);
+      if (history) renderFlowChart(Object.values(history).sort((a,b) => a.timestamp - b.timestamp));
+    } catch(err){
+      console.error('Firebase REST fetch failed, using simulated data until it recovers:', err);
+      showFallback('Could not reach the database (' + err.message + ').');
+    }
+  };
+  tickFn();
+  liveIntervalId = setInterval(tickFn, POLL_INTERVAL_MS);
 }
 
-if (looksConfigured(FIREBASE_CONFIG)) startFirebase(); else startSimulation();
+if (looksConfigured(FIREBASE_CONFIG)) startLive(); else startSimulation();
 </script>
 </body>
 </html>
+FLOODAI_EOF_MARKER
