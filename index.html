@@ -1,0 +1,857 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FloodAI — Flood Monitoring, Prediction &amp; Warning</title>
+
+<!--
+  ============================================================================
+  FLOODAI DASHBOARD
+  ============================================================================
+  Same Firebase-backed pattern as before, now built around two sensors and
+  an on-device ("edge") risk model instead of a server-side one:
+
+    - Water level sensor  (ultrasonic / pressure — cm from a reference point)
+    - DHT11                (temperature °C + relative humidity %, rain proxy)
+
+  DATABASE SHAPE
+  ----------------------------------------------------------------------------
+  /sensors/current           -> { waterLevel, temperature, humidity, timestamp }
+  /sensors/history/<pushId>  -> same fields, one per reading, drives the trend
+                                 chart and the on-device rate-of-rise calc
+
+  The "AI / edge" framing here is real, just simple by design: the risk
+  score is computed client-side, in this file, the instant a new reading
+  arrives — no round trip to a cloud model. That local computation is what
+  "edge computing" means in a dashboard this size; swap FLOOD_MODEL for a
+  trained model's output later without changing anything else on the page.
+
+  Connect your own project: paste your config into FIREBASE_CONFIG below.
+  Until then this runs in simulation mode, clearly labeled on screen.
+  ============================================================================
+-->
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-database-compat.js"></script>
+
+<style>
+  :root{
+    --safe:#5EE6D9;
+    --watch:#F2A93B;
+    --danger:#FF6B5E;
+    --ink:#EAF2F1;
+    --ink-dim:#A9BDBB;
+    --ink-faint:#7C918F;
+    --glass:rgba(12,20,26,0.58);
+    --glass-card:rgba(255,255,255,0.045);
+    --glass-border:rgba(255,255,255,0.09);
+  }
+
+  *{box-sizing:border-box;}
+  html,body{margin:0;padding:0;min-height:100vh;font-family:'Inter',sans-serif;color:var(--ink);}
+
+  a, button{font-family:inherit;}
+  :focus-visible{outline:2px solid var(--safe); outline-offset:2px; border-radius:4px;}
+
+  @media (prefers-reduced-motion: reduce){
+    *{animation-duration:0.001ms !important; animation-iteration-count:1 !important; transition-duration:0.001ms !important;}
+  }
+
+  body{
+    background:
+      radial-gradient(ellipse 900px 500px at 15% 0%, rgba(255,150,90,0.20), transparent 60%),
+      radial-gradient(ellipse 700px 500px at 85% 10%, rgba(120,90,200,0.18), transparent 55%),
+      linear-gradient(180deg, #1B1030 0%, #2A1B3D 22%, #3A2A44 42%, #1E2E3E 65%, #0C1620 100%);
+    background-attachment:fixed;
+    padding:28px 16px 60px;
+  }
+
+  /* faint horizon reflection lines — grounds the backdrop in water without
+     literally illustrating a flood */
+  body::before{
+    content:"";
+    position:fixed; inset:0; z-index:0; pointer-events:none;
+    background-image:repeating-linear-gradient(180deg, rgba(255,255,255,0.02) 0px, rgba(255,255,255,0.02) 1px, transparent 1px, transparent 46px);
+    mix-blend-mode:overlay;
+  }
+
+  .stage{max-width:1180px; margin:0 auto; position:relative; z-index:1;}
+
+  .panel{
+    background:var(--glass);
+    backdrop-filter:blur(18px);
+    -webkit-backdrop-filter:blur(18px);
+    border:1px solid var(--glass-border);
+    border-radius:28px;
+    padding:22px 26px 28px;
+    box-shadow:0 30px 80px rgba(0,0,0,0.45);
+    animation:panelIn 0.5s ease both;
+  }
+  @keyframes panelIn{
+    from{opacity:0; transform:translateY(10px);}
+    to{opacity:1; transform:translateY(0);}
+  }
+
+  /* ---------- header ---------- */
+  .top-row{
+    display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:14px;
+    padding-bottom:18px; margin-bottom:18px; border-bottom:1px solid var(--glass-border);
+  }
+
+  .brand{display:flex; align-items:center; gap:9px;}
+  .brand .mark{
+    width:30px; height:30px; border-radius:9px;
+    background:linear-gradient(135deg, var(--safe), #3E9FDA);
+    display:flex; align-items:center; justify-content:center;
+    font-size:15px; font-weight:700; color:#08201D;
+  }
+  .brand h1{font-family:'Space Grotesk',sans-serif; font-size:19px; font-weight:600; margin:0; letter-spacing:0.2px;}
+  .brand h1 b{font-weight:700; background:linear-gradient(90deg, var(--safe), #8FD8FF); -webkit-background-clip:text; background-clip:text; color:transparent;}
+
+  .compare-chips{display:flex; align-items:center; gap:10px; flex-wrap:wrap;}
+  .chip{
+    display:flex; align-items:baseline; gap:6px;
+    background:var(--glass-card); border:1px solid var(--glass-border);
+    border-radius:999px; padding:7px 14px 7px 12px;
+  }
+  .chip .label{font-size:11.5px; color:var(--ink-dim);}
+  .chip .num{font-family:'Space Grotesk',sans-serif; font-weight:600; font-size:16px;}
+  .chip.risk .num{color:var(--watch);}
+  .chip.base .num{color:var(--ink);}
+
+  .delta-note{font-size:12.5px; color:var(--ink-dim); max-width:220px; line-height:1.4;}
+  .delta-note b{color:var(--watch); font-weight:600;}
+
+  .controls{display:flex; align-items:center; gap:14px;}
+  .toggle{
+    width:38px; height:21px; border-radius:999px; background:linear-gradient(90deg, var(--safe), #3E9FDA);
+    position:relative; cursor:pointer; border:none; padding:0; transition:filter .2s ease;
+  }
+  .toggle:hover{filter:brightness(1.1);}
+  .toggle::after{content:""; position:absolute; width:16px; height:16px; border-radius:50%; background:#fff; top:2.5px; right:2.5px; transition:right .2s ease;}
+  .toggle.off{background:rgba(255,255,255,0.14);}
+  .toggle.off::after{right:19.5px;}
+  .icon-btn{
+    width:34px; height:34px; border-radius:10px; background:var(--glass-card); border:1px solid var(--glass-border);
+    display:flex; align-items:center; justify-content:center; color:var(--ink-dim); cursor:pointer;
+    transition:background .18s ease, color .18s ease, transform .18s ease;
+  }
+  .icon-btn:hover{background:rgba(255,255,255,0.09); color:var(--ink); transform:translateY(-1px);}
+  .icon-btn svg{width:16px; height:16px;}
+  .avatar{
+    width:34px; height:34px; border-radius:50%; background:linear-gradient(135deg, #8FD8FF, #5EE6D9);
+    flex-shrink:0;
+  }
+
+  /* ---------- sub header ---------- */
+  .sub-row{display:flex; align-items:center; gap:12px; margin-bottom:20px; flex-wrap:wrap;}
+  .back{color:var(--ink-dim); font-size:14px;}
+  .sub-row h2{font-family:'Space Grotesk',sans-serif; font-size:20px; font-weight:600; margin:0;}
+  .status-pill{
+    font-size:11.5px; padding:4px 11px; border-radius:999px; border:1px solid rgba(242,169,59,0.4);
+    color:var(--watch); background:rgba(242,169,59,0.1);
+  }
+  .status-pill.safe{color:var(--safe); border-color:rgba(94,230,217,0.4); background:rgba(94,230,217,0.1);}
+  .status-pill.danger{color:var(--danger); border-color:rgba(255,107,94,0.4); background:rgba(255,107,94,0.1);}
+
+  #simTag{
+    margin-left:auto; font-size:11px; color:var(--watch); border:1px solid rgba(242,169,59,0.35);
+    padding:4px 10px; border-radius:999px; background:rgba(242,169,59,0.08);
+  }
+
+  /* ---------- main grid ---------- */
+  .main-grid{display:grid; grid-template-columns:2fr 1fr; gap:16px; margin-bottom:16px;}
+  @media (max-width:900px){.main-grid{grid-template-columns:1fr;}}
+
+  .card{
+    background:var(--glass-card); border:1px solid var(--glass-border); border-radius:18px; padding:20px;
+  }
+
+  .card h3{font-family:'Space Grotesk',sans-serif; font-size:14.5px; font-weight:600; margin:0 0 4px;}
+  .card p.desc{font-size:12.5px; color:var(--ink-dim); margin:0 0 16px; line-height:1.5; max-width:340px;}
+
+  .gauge-wrap{display:flex; gap:18px; align-items:center; flex-wrap:wrap;}
+
+  .gauge-box{position:relative; width:280px; height:170px; margin:0 auto;}
+  .gauge-center{
+    position:absolute; left:50%; top:66%; transform:translate(-50%,-50%); text-align:center;
+  }
+  .gauge-pct{font-family:'Space Grotesk',sans-serif; font-size:38px; font-weight:700; line-height:1;}
+  .gauge-sub{font-size:11px; color:var(--ink-dim); margin-top:4px;}
+
+  .orbit-stat{
+    position:absolute; text-align:center; font-family:'Space Grotesk',sans-serif;
+  }
+  .orbit-stat .v{font-size:15px; font-weight:600;}
+  .orbit-stat .l{font-size:9.5px; color:var(--ink-faint); font-family:'Inter',sans-serif; margin-top:1px;}
+  .os-1{top:2px; left:6px;}
+  .os-2{top:0px; right:2px;}
+  .os-3{bottom:26px; left:-6px;}
+  .os-4{bottom:26px; right:-6px;}
+
+  .radar-box{flex:1; min-width:220px;}
+  #radarChart{max-height:200px;}
+
+  /* right column trend card */
+  .trend-card{display:flex; flex-direction:column; height:100%;}
+  .trend-headline{display:flex; align-items:baseline; gap:6px; margin-bottom:2px;}
+  .trend-headline .n{font-family:'Space Grotesk',sans-serif; font-size:26px; font-weight:700;}
+  .trend-headline .u{font-size:12px; color:var(--ink-dim);}
+  .tag{
+    display:inline-block; font-size:10.5px; padding:2px 9px; border-radius:999px; margin-top:6px;
+    border:1px solid rgba(94,230,217,0.4); color:var(--safe); background:rgba(94,230,217,0.08); width:fit-content;
+  }
+  .tag.rising{border-color:rgba(242,169,59,0.4); color:var(--watch); background:rgba(242,169,59,0.08);}
+  #levelChart{margin-top:14px; max-height:130px;}
+  .view-link{
+    margin-top:14px; align-self:flex-start; font-size:12px; color:var(--ink);
+    background:var(--glass-card); border:1px solid var(--glass-border); padding:7px 13px; border-radius:999px;
+  }
+
+  /* ---------- lower cards row ---------- */
+  .cards-row{display:grid; grid-template-columns:1fr 1fr 1fr; gap:16px; margin-bottom:16px;}
+  @media (max-width:900px){.cards-row{grid-template-columns:1fr;}}
+
+  .score-row{display:flex; align-items:baseline; gap:14px; margin-bottom:12px;}
+  .score-num{font-family:'Space Grotesk',sans-serif; font-size:24px; font-weight:700;}
+  .score-num small{font-size:12px; color:var(--ink-dim); font-weight:500;}
+  .score-base{font-size:12.5px; color:var(--ink-dim);}
+  .score-base b{color:var(--ink);}
+
+  .bar-track{height:7px; border-radius:4px; background:rgba(255,255,255,0.08); overflow:hidden; margin-bottom:5px;}
+  .bar-fill{height:100%; border-radius:4px; background:linear-gradient(90deg, var(--safe), var(--watch), var(--danger)); width:60%; transition:width .6s ease;}
+  .bar-labels{display:flex; justify-content:space-between; font-size:10px; color:var(--ink-faint); margin-bottom:14px;}
+
+  .reading-row{
+    display:flex; justify-content:space-between; align-items:center; padding:9px 0; border-bottom:1px solid var(--glass-border); font-size:13px;
+  }
+  .reading-row:last-child{border-bottom:none;}
+  .reading-row .rname{color:var(--ink-dim);}
+  .reading-row .rval{font-family:'Space Grotesk',sans-serif; font-weight:600;}
+  .reading-row .rrange{font-size:10.5px; color:var(--ink-faint); display:block; margin-top:1px;}
+
+  .infl-top{display:flex; justify-content:space-between; margin-bottom:10px;}
+  .infl-metric{}
+  .infl-metric .v{font-family:'Space Grotesk',sans-serif; font-size:20px; font-weight:700;}
+  .infl-metric .l{font-size:10.5px; color:var(--ink-faint);}
+  .infl-metric.right{text-align:right;}
+
+  .change-row{display:flex; align-items:center; gap:6px; font-size:12.5px; color:var(--ink-dim); margin:10px 0 12px;}
+  .change-row b{color:var(--watch);}
+  .infl-notes{font-size:12px; color:var(--ink-dim); line-height:1.6; padding-left:14px; margin:0;}
+  .infl-notes li{margin-bottom:4px;}
+
+  /* ---------- markers section ---------- */
+  .markers-card{padding:20px;}
+  .markers-head{display:flex; align-items:center; gap:8px; margin-bottom:14px;}
+  .markers-head h3{margin:0;}
+  .ai-badge{
+    font-size:10px; color:#08201D; background:linear-gradient(90deg, var(--safe), #8FD8FF);
+    padding:3px 9px; border-radius:999px; font-weight:600;
+  }
+  .markers-grid{display:grid; grid-template-columns:1fr 1fr; gap:22px 28px;}
+  @media (max-width:700px){.markers-grid{grid-template-columns:1fr;}}
+  .marker-group-title{font-size:11.5px; color:var(--ink-faint); margin-bottom:8px; display:flex; align-items:center; gap:6px;}
+  .marker-group-title .sw{width:7px; height:7px; border-radius:2px; background:var(--safe);}
+  .marker-list{list-style:none; margin:0 0 14px; padding:0;}
+  .marker-list li{
+    display:flex; justify-content:space-between; padding:7px 0; border-bottom:1px solid var(--glass-border); font-size:13px;
+  }
+  .marker-list li:last-child{border-bottom:none;}
+  .marker-list .mname{color:var(--ink);}
+  .marker-list .mval{color:var(--ink-dim); font-size:12px;}
+
+  footer{margin-top:6px; text-align:center; font-size:11.5px; color:var(--ink-faint);}
+  footer a{color:var(--safe); text-decoration:none;}
+
+  /* ---------- evacuation banner ---------- */
+  .evac-banner{
+    display:none;
+    align-items:center; gap:16px; flex-wrap:wrap;
+    background:linear-gradient(90deg, rgba(255,107,94,0.16), rgba(255,107,94,0.06));
+    border:1px solid rgba(255,107,94,0.45);
+    border-radius:16px; padding:16px 20px; margin-bottom:16px;
+  }
+  .evac-banner.live{display:flex; animation:evacPulse 1.8s ease-in-out infinite;}
+  @keyframes evacPulse{
+    0%,100%{box-shadow:0 0 0 0 rgba(255,107,94,0.35);}
+    50%{box-shadow:0 0 0 10px rgba(255,107,94,0);}
+  }
+  .evac-icon{
+    width:42px; height:42px; border-radius:50%; background:var(--danger);
+    display:flex; align-items:center; justify-content:center; flex-shrink:0;
+    animation:evacSpin 1.4s ease-in-out infinite; color:#2A0806;
+  }
+  .evac-icon svg{width:20px; height:20px;}
+  @keyframes evacSpin{0%,90%,100%{transform:scale(1);} 45%{transform:scale(1.12);}}
+  .evac-body{flex:1; min-width:220px;}
+  .evac-body h4{margin:0 0 3px; font-family:'Space Grotesk',sans-serif; font-size:15.5px; color:var(--danger);}
+  .evac-body p{margin:0; font-size:12.5px; color:var(--ink-dim); line-height:1.5;}
+  .evac-actions{display:flex; align-items:center; gap:10px; flex-wrap:wrap;}
+  .evac-btn{
+    font-size:12px; padding:8px 15px; border-radius:999px; border:1px solid rgba(255,107,94,0.5);
+    color:var(--danger); background:rgba(255,107,94,0.1); cursor:pointer; transition:background .18s ease;
+  }
+  .evac-btn:hover{background:rgba(255,107,94,0.2);}
+  .evac-status{font-size:11px; color:var(--ink-faint);}
+  .evac-status.sent{color:var(--danger);}
+
+  /* ---------- safe place card ---------- */
+  .safe-card{margin-bottom:16px;}
+  .safe-row{display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:16px;}
+  .safe-place{display:flex; align-items:center; gap:14px;}
+  .safe-pin{
+    width:40px; height:40px; border-radius:12px; background:rgba(94,230,217,0.12); border:1px solid rgba(94,230,217,0.35);
+    display:flex; align-items:center; justify-content:center; flex-shrink:0; color:var(--safe);
+  }
+  .safe-pin svg{width:18px; height:18px;}
+  .safe-name{font-family:'Space Grotesk',sans-serif; font-size:15px; font-weight:600;}
+  .safe-meta{font-size:12px; color:var(--ink-dim); margin-top:2px;}
+  .safe-directions{
+    display:inline-flex; align-items:center; gap:6px;
+    font-size:12px; color:var(--ink); background:var(--glass-card); border:1px solid var(--glass-border);
+    padding:8px 16px; border-radius:999px; text-decoration:none; transition:background .18s ease, transform .18s ease;
+  }
+  .safe-directions:hover{background:rgba(255,255,255,0.1); transform:translateY(-1px);}
+  .safe-alt{font-size:11.5px; color:var(--ink-faint); margin-top:12px;}
+
+  #gaugeArc{transition:stroke-dashoffset .6s ease, stroke .4s ease;}
+  #gaugePct{transition:color .4s ease;}
+</style>
+</head>
+<body>
+
+<div class="stage">
+  <div class="panel">
+
+    <div class="top-row">
+      <div class="brand">
+        <div class="mark">FA</div>
+        <h1>Flood<b>AI</b></h1>
+      </div>
+
+      <div class="compare-chips">
+        <div class="chip risk"><span class="label">Flood Risk Index</span><span class="num" id="chipRisk">—</span></div>
+        <div class="chip base"><span class="label">Seasonal Baseline</span><span class="num">22</span></div>
+        <div class="delta-note">Conditions are rising <b id="chipDelta">—</b> faster than the seasonal baseline for this gauge point.</div>
+      </div>
+
+      <div class="controls">
+        <button class="icon-btn" id="refreshBtn" title="Refresh now" aria-label="Refresh now">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3-6.7"/><path d="M21 4v6h-6"/></svg>
+        </button>
+        <button class="toggle" id="liveToggle" title="Toggle live updates" aria-label="Toggle live updates"></button>
+        <button class="icon-btn" id="exportBtn" title="Export readings" aria-label="Export readings">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/></svg>
+        </button>
+        <div class="avatar"></div>
+      </div>
+    </div>
+
+    <div class="sub-row">
+      <span class="back">‹</span>
+      <h2>Flood Report</h2>
+      <span class="status-pill watch" id="statusPill">Elevated</span>
+      <span id="simTag">Simulated data</span>
+    </div>
+
+    <div class="evac-banner" id="evacBanner">
+      <div class="evac-icon" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0Z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+      </div>
+      <div class="evac-body">
+        <h4>Evacuation signal active</h4>
+        <p id="evacText">Water level and rise rate exceed the danger threshold. Move to the nearest safe place listed below.</p>
+      </div>
+      <div class="evac-actions">
+        <span class="evac-status sent" id="evacStatus">Signal sent — 0 devices notified</span>
+        <button class="evac-btn" id="evacDismiss">Acknowledge</button>
+      </div>
+    </div>
+
+    <div class="card safe-card" id="safeCard" style="display:none;">
+      <h3>Nearest Safe Place</h3>
+      <div class="safe-row">
+        <div class="safe-place">
+          <div class="safe-pin" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 10c0 6-8 12-8 12s-8-6-8-12a8 8 0 0 1 16 0Z"/><circle cx="12" cy="10" r="3"/></svg>
+          </div>
+          <div>
+            <div class="safe-name" id="safeName">—</div>
+            <div class="safe-meta" id="safeMeta">—</div>
+          </div>
+        </div>
+        <a class="safe-directions" id="safeDirections" href="#" target="_blank" rel="noopener">
+          Get directions
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:13px;height:13px;"><path d="M7 17 17 7"/><path d="M7 7h10v10"/></svg>
+        </a>
+      </div>
+      <div class="safe-alt" id="safeAlt"></div>
+    </div>
+
+    <div class="main-grid">
+      <div class="card">
+        <h3>Flood Risk Index</h3>
+        <p class="desc">On-device inference combining current water level, rate of rise, and humidity to estimate flood probability in the next 6 hours.</p>
+
+        <div class="gauge-wrap">
+          <div class="gauge-box">
+            <svg viewBox="0 0 280 160" width="280" height="160">
+              <path d="M 20 150 A 120 120 0 0 1 260 150" fill="none" stroke="rgba(255,255,255,0.08)" stroke-width="14" stroke-linecap="round"/>
+              <path id="gaugeArc" d="M 20 150 A 120 120 0 0 1 260 150" fill="none" stroke="var(--watch)" stroke-width="14" stroke-linecap="round" stroke-dasharray="377" stroke-dashoffset="200"/>
+            </svg>
+            <div class="gauge-center">
+              <div class="gauge-pct" id="gaugePct" style="color:var(--watch);">—</div>
+              <div class="gauge-sub">probability, next 6h</div>
+            </div>
+            <div class="orbit-stat os-1"><div class="v" id="osLevel">—</div><div class="l">Water level</div></div>
+            <div class="orbit-stat os-2"><div class="v" id="osRise">—</div><div class="l">Rate of rise</div></div>
+            <div class="orbit-stat os-3"><div class="v" id="osHum">—</div><div class="l">Humidity</div></div>
+            <div class="orbit-stat os-4"><div class="v" id="osTemp">—</div><div class="l">Temperature</div></div>
+          </div>
+
+          <div class="radar-box">
+            <canvas id="radarChart"></canvas>
+          </div>
+        </div>
+      </div>
+
+      <div class="card trend-card">
+        <h3>Water Level Trend</h3>
+        <p class="desc" style="margin-bottom:8px;">Live readings from the gauge sensor.</p>
+        <div class="trend-headline"><span class="n" id="levelNow">—</span><span class="u">cm</span></div>
+        <span class="tag" id="levelTag">Stable</span>
+        <canvas id="levelChart"></canvas>
+        <div class="view-link">View full report</div>
+      </div>
+    </div>
+
+    <div class="cards-row">
+      <div class="card">
+        <h3>AI Prediction Score <span style="float:right;"><span class="ai-badge">edge</span></span></h3>
+        <p class="desc">Computed locally the instant a new reading arrives — no cloud round trip.</p>
+        <div class="score-row">
+          <div class="score-num" id="scoreNum">— <small>/ 100</small></div>
+          <div class="score-base">Baseline <b>18</b> · Moderate risk band</div>
+        </div>
+        <div class="bar-track"><div class="bar-fill" id="scoreBar"></div></div>
+        <div class="bar-labels"><span>Low</span><span>Medium</span><span>High</span></div>
+        <div class="view-link">View full report</div>
+      </div>
+
+      <div class="card">
+        <h3>Sensor Readings</h3>
+        <p class="desc">Live values against normal operating range.</p>
+        <div class="reading-row"><span class="rname">Water level<span class="rrange">Normal &lt; 40 cm</span></span><span class="rval" id="rowLevel">—</span></div>
+        <div class="reading-row"><span class="rname">Rate of rise<span class="rrange">Normal &lt; 2 cm/hr</span></span><span class="rval" id="rowRise">—</span></div>
+        <div class="reading-row"><span class="rname">Temperature<span class="rrange">DHT11, ambient</span></span><span class="rval" id="rowTemp">—</span></div>
+        <div class="reading-row"><span class="rname">Humidity<span class="rrange">Normal &lt; 80%</span></span><span class="rval" id="rowHum">—</span></div>
+      </div>
+
+      <div class="card">
+        <h3>Rainfall &amp; Humidity Trend</h3>
+        <div class="infl-top">
+          <div class="infl-metric"><div class="v" id="humPct">—</div><div class="l">Current humidity</div></div>
+          <div class="infl-metric right"><div class="v" id="humPctile">—</div><div class="l">vs seasonal norm</div></div>
+        </div>
+        <div class="change-row">Change over 24h: <b id="humChange">—</b></div>
+        <ul class="infl-notes">
+          <li>Sustained humidity above 85% suggests active or recent rainfall upstream.</li>
+          <li>Combined with a rising water level, this raises confidence in the risk score above.</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="card markers-card">
+      <div class="markers-head"><h3>Edge AI Markers</h3><span class="ai-badge">on-device</span></div>
+      <div class="markers-grid">
+        <div>
+          <div class="marker-group-title"><span class="sw" style="background:var(--watch);"></span>Water level patterns</div>
+          <ul class="marker-list" id="markersLevel"></ul>
+        </div>
+        <div>
+          <div class="marker-group-title"><span class="sw" style="background:#8FD8FF;"></span>Atmospheric patterns</div>
+          <ul class="marker-list" id="markersAtmo"></ul>
+        </div>
+      </div>
+    </div>
+
+    <footer>Thresholds and model weights are set in <code>FLOOD_MODEL</code> in the page source — calibrate to your gauge point. · Last sync: <span id="lastSync">—</span></footer>
+  </div>
+</div>
+
+<script>
+/* ============================================================================
+   1. CONFIGURATION
+   ============================================================================ */
+const FIREBASE_CONFIG = {
+  apiKey: "YOUR_API_KEY",
+  authDomain: "YOUR_PROJECT.firebaseapp.com",
+  databaseURL: "https://YOUR_PROJECT-default-rtdb.firebaseio.com",
+  projectId: "YOUR_PROJECT",
+};
+
+// Edge inference model: thresholds + weights, tuned to your gauge point.
+const FLOOD_MODEL = {
+  waterLevel: { watch: 40, warning: 70, danger: 100 },   // cm
+  rateOfRise: { watch: 2, warning: 5, danger: 10 },       // cm/hr
+  humidity:   { watch: 80, warning: 90, danger: 96 },     // % RH
+  weights:    { waterLevel: 0.55, rateOfRise: 0.30, humidity: 0.15 },
+};
+
+const HISTORY_POINTS = 24;
+
+// Gauge station location, and known safe places (shelters, high ground,
+// evacuation centers) near it. Replace with real coordinates for your site —
+// get them by right-clicking the spot in Google Maps and copying the
+// lat/lng shown. Add as many entries as you have.
+const STATION_COORDS = { lat: 6.5244, lng: 3.3792 }; // TODO: your gauge point
+
+const SAFE_ZONES = [
+  { name: "TODO: Community Hall",     lat: 6.5300, lng: 3.3850, note: "Designated evacuation center" },
+  { name: "TODO: Secondary School",   lat: 6.5180, lng: 3.3700, note: "High ground, generator on site" },
+  { name: "TODO: Health Center",      lat: 6.5320, lng: 3.3650, note: "First aid available" },
+];
+
+// Trigger the evacuation signal at this risk band or above.
+const EVACUATION_TRIGGER_BAND = "DANGER";
+
+/* ============================================================================
+   2. STATE + CHARTS
+   ============================================================================ */
+let currentBand = "SAFE";
+let simState = { waterLevel: 18, temperature: 27, humidity: 58, prevLevel: 18 };
+let simStep = null;
+let simIntervalId = null;
+
+const radarCtx = document.getElementById('radarChart').getContext('2d');
+const radarChart = new Chart(radarCtx, {
+  type: 'radar',
+  data: {
+    labels: ['Water level', 'Rate of rise', 'Humidity', 'Temp volatility', 'Historical deviation'],
+    datasets: [{
+      data: [10,10,10,10,10],
+      backgroundColor: 'rgba(94,230,217,0.15)',
+      borderColor: '#5EE6D9',
+      pointBackgroundColor: '#5EE6D9',
+      borderWidth: 2,
+    }]
+  },
+  options: {
+    responsive:true,
+    plugins:{legend:{display:false}},
+    scales:{ r:{
+      min:0, max:100,
+      grid:{color:'rgba(255,255,255,0.08)'},
+      angleLines:{color:'rgba(255,255,255,0.08)'},
+      pointLabels:{color:'#9FB4B2', font:{size:10.5}},
+      ticks:{display:false, backdropColor:'transparent'}
+    }}
+  }
+});
+
+const levelCtx = document.getElementById('levelChart').getContext('2d');
+const levelChart = new Chart(levelCtx, {
+  type:'line',
+  data:{ labels:[], datasets:[{ data:[], borderColor:'#5EE6D9', backgroundColor:'rgba(94,230,217,0.12)', borderWidth:2, pointRadius:0, tension:0.35, fill:true }] },
+  options:{
+    responsive:true,
+    plugins:{legend:{display:false}},
+    scales:{ x:{display:false}, y:{display:false} }
+  }
+});
+
+/* ============================================================================
+   3. MODEL + RENDERING
+   ============================================================================ */
+function norm(v, t){ return Math.min(1, Math.max(0, v / t.danger)); }
+
+function computeRisk(d){
+  const m = FLOOD_MODEL;
+  const score = 100 * (
+    m.weights.waterLevel  * norm(d.waterLevel, m.waterLevel) +
+    m.weights.rateOfRise  * norm(d.rateOfRise, m.rateOfRise) +
+    m.weights.humidity    * norm(d.humidity, m.humidity)
+  );
+  return Math.round(Math.min(100, score));
+}
+
+function bandFor(score){
+  if (score >= 75) return { name:'DANGER', color:'var(--danger)', pill:'danger', label:'Danger' };
+  if (score >= 50) return { name:'WARNING', color:'var(--danger)', pill:'danger', label:'Warning' };
+  if (score >= 25) return { name:'WATCH', color:'var(--watch)', pill:'watch', label:'Elevated' };
+  return { name:'SAFE', color:'var(--safe)', pill:'safe', label:'Normal' };
+}
+
+function render(d){
+  const score = computeRisk(d);
+  const band = bandFor(score);
+
+  // header chips
+  document.getElementById('chipRisk').textContent = score;
+  document.getElementById('chipRisk').parentElement.querySelector('.num').style.color = band.color;
+  const deltaX = (score / 22).toFixed(1);
+  document.getElementById('chipDelta').textContent = deltaX + 'x';
+
+  // status pill
+  const pill = document.getElementById('statusPill');
+  pill.className = 'status-pill ' + band.pill;
+  pill.textContent = band.label;
+
+  // gauge
+  const pctOfCircle = 377 - (377 * score / 100);
+  document.getElementById('gaugeArc').setAttribute('stroke-dashoffset', pctOfCircle);
+  document.getElementById('gaugeArc').style.stroke = band.color;
+  const gaugePct = document.getElementById('gaugePct');
+  gaugePct.textContent = score + '%';
+  gaugePct.style.color = band.color;
+
+  document.getElementById('osLevel').textContent = Math.round(d.waterLevel) + ' cm';
+  document.getElementById('osRise').textContent = d.rateOfRise.toFixed(1) + ' cm/hr';
+  document.getElementById('osHum').textContent = Math.round(d.humidity) + '%';
+  document.getElementById('osTemp').textContent = d.temperature.toFixed(1) + '°C';
+
+  // radar
+  radarChart.data.datasets[0].data = [
+    Math.round(norm(d.waterLevel, FLOOD_MODEL.waterLevel)*100),
+    Math.round(norm(d.rateOfRise, FLOOD_MODEL.rateOfRise)*100),
+    Math.round(norm(d.humidity, FLOOD_MODEL.humidity)*100),
+    Math.min(100, Math.round(Math.abs(d.temperature-27)*8)),
+    Math.min(100, Math.round(score*0.9)),
+  ];
+  radarChart.update();
+
+  // trend card
+  document.getElementById('levelNow').textContent = Math.round(d.waterLevel);
+  const levelTag = document.getElementById('levelTag');
+  if (d.rateOfRise > FLOOD_MODEL.rateOfRise.watch){
+    levelTag.textContent = 'Rising'; levelTag.className = 'tag rising';
+  } else {
+    levelTag.textContent = 'Stable'; levelTag.className = 'tag';
+  }
+
+  // prediction score card
+  document.getElementById('scoreNum').innerHTML = score + ' <small>/ 100</small>';
+  document.getElementById('scoreBar').style.width = Math.max(4, score) + '%';
+
+  // readings list
+  document.getElementById('rowLevel').textContent = Math.round(d.waterLevel) + ' cm';
+  document.getElementById('rowRise').textContent = d.rateOfRise.toFixed(1) + ' cm/hr';
+  document.getElementById('rowTemp').textContent = d.temperature.toFixed(1) + ' °C';
+  document.getElementById('rowHum').textContent = Math.round(d.humidity) + ' %';
+
+  // humidity card
+  document.getElementById('humPct').textContent = Math.round(d.humidity) + '%';
+  document.getElementById('humPctile').textContent = Math.round(norm(d.humidity, FLOOD_MODEL.humidity)*100) + 'th';
+  document.getElementById('humChange').textContent = (d.humidity > 75 ? '+' : '') + (d.humidity - 60).toFixed(0) + ' pts';
+
+  // markers
+  renderMarkers(d, score);
+
+  document.getElementById('lastSync').textContent = new Date(d.timestamp || Date.now()).toLocaleTimeString();
+
+  if (band.name !== currentBand){
+    currentBand = band.name;
+    handleBandChange(band, d);
+  }
+}
+
+/* ============================================================================
+   3b. EVACUATION SIGNAL + NEAREST SAFE PLACE
+   ============================================================================ */
+function haversineKm(a, b){
+  const R = 6371;
+  const dLat = (b.lat - a.lat) * Math.PI/180;
+  const dLng = (b.lng - a.lng) * Math.PI/180;
+  const s = Math.sin(dLat/2)**2 + Math.cos(a.lat*Math.PI/180)*Math.cos(b.lat*Math.PI/180)*Math.sin(dLng/2)**2;
+  return R * 2 * Math.atan2(Math.sqrt(s), Math.sqrt(1-s));
+}
+
+function nearestSafeZone(){
+  return SAFE_ZONES
+    .map(z => ({ ...z, distanceKm: haversineKm(STATION_COORDS, z) }))
+    .sort((a,b) => a.distanceKm - b.distanceKm);
+}
+
+function showSafeCard(){
+  const ranked = nearestSafeZone();
+  const nearest = ranked[0];
+  document.getElementById('safeCard').style.display = 'block';
+  document.getElementById('safeName').textContent = nearest.name;
+  document.getElementById('safeMeta').textContent = `${nearest.distanceKm.toFixed(1)} km away · ${nearest.note}`;
+  document.getElementById('safeDirections').href =
+    `https://www.google.com/maps/dir/?api=1&origin=${STATION_COORDS.lat},${STATION_COORDS.lng}&destination=${nearest.lat},${nearest.lng}`;
+  const alts = ranked.slice(1).map(z => `${z.name} (${z.distanceKm.toFixed(1)} km)`).join(' · ');
+  document.getElementById('safeAlt').textContent = alts ? 'Other options: ' + alts : '';
+}
+
+let evacuationSent = false;
+function handleBandChange(band, d){
+  const bandOrder = ['SAFE','WATCH','WARNING','DANGER'];
+  const reached = bandOrder.indexOf(band.name) >= bandOrder.indexOf(EVACUATION_TRIGGER_BAND);
+
+  if (reached && !evacuationSent){
+    sendEvacuationSignal(d);
+  } else if (!reached){
+    evacuationSent = false;
+    document.getElementById('evacBanner').classList.remove('live');
+  }
+}
+
+function sendEvacuationSignal(d){
+  evacuationSent = true;
+  document.getElementById('evacBanner').classList.add('live');
+  document.getElementById('evacText').textContent =
+    `Water level ${Math.round(d.waterLevel)} cm, rising ${d.rateOfRise.toFixed(1)} cm/hr — this exceeds the danger threshold. Move to the nearest safe place now.`;
+  showSafeCard();
+  playSiren();
+
+  // Write the signal to Firebase so any subscribed system (SMS gateway,
+  // push notifications, physical sirens) can act on it. This page only
+  // raises the flag — dispatching it to real devices needs a small backend
+  // (see functions/index.js) listening on this same path.
+  try{
+    if (firebase.apps && firebase.apps.length){
+      firebase.database().ref('evacuation/current').set({
+        active: true,
+        level: currentBand,
+        waterLevel: d.waterLevel,
+        rateOfRise: d.rateOfRise,
+        nearestSafeZone: nearestSafeZone()[0].name,
+        timestamp: Date.now(),
+      });
+    }
+  } catch(e){ console.warn('Evacuation signal not written to Firebase (offline/simulation):', e); }
+
+  document.getElementById('evacStatus').textContent = 'Signal sent — dispatch pending backend';
+}
+
+function playSiren(){
+  try{
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const o = ctx.createOscillator();
+    const g = ctx.createGain();
+    o.type = 'sine'; o.frequency.setValueAtTime(880, ctx.currentTime);
+    g.gain.setValueAtTime(0.001, ctx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.15, ctx.currentTime + 0.05);
+    g.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.6);
+    o.connect(g); g.connect(ctx.destination);
+    o.start(); o.stop(ctx.currentTime + 0.6);
+  } catch(e){ /* autoplay may be blocked until the user interacts with the page — non-fatal */ }
+}
+
+document.getElementById('evacDismiss').addEventListener('click', () => {
+  document.getElementById('evacBanner').classList.remove('live');
+  document.getElementById('evacStatus').textContent = 'Acknowledged — still monitoring';
+});
+
+let liveUpdatesOn = true;
+document.getElementById('liveToggle').addEventListener('click', (e) => {
+  liveUpdatesOn = !liveUpdatesOn;
+  e.currentTarget.classList.toggle('off', !liveUpdatesOn);
+  if (!liveUpdatesOn && simIntervalId){ clearInterval(simIntervalId); simIntervalId = null; }
+  else if (liveUpdatesOn && !looksConfigured(FIREBASE_CONFIG) && !simIntervalId){ simIntervalId = setInterval(simStep, 3000); }
+});
+document.getElementById('refreshBtn').addEventListener('click', () => {
+  if (!looksConfigured(FIREBASE_CONFIG)) simStep();
+});
+document.getElementById('exportBtn').addEventListener('click', () => {
+  const rows = levelChart.data.labels.map((t,i) => `${t},${levelChart.data.datasets[0].data[i]}`);
+  const csv = "time,water_level_cm\n" + rows.join("\n");
+  const blob = new Blob([csv], { type: 'text/csv' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'floodai-readings.csv';
+  a.click();
+});
+
+function renderMarkers(d, score){
+  const level = [];
+  const atmo = [];
+
+  level.push({ n:'Water level vs baseline', v: (d.waterLevel > 30 ? '+' : '') + Math.round(d.waterLevel - 18) + ' cm' });
+  level.push({ n:'Rate-of-rise pattern', v: d.rateOfRise > FLOOD_MODEL.rateOfRise.watch ? 'Rapid rise' : 'Normal' });
+  level.push({ n:'Diurnal deviation', v: score > 50 ? 'Above expected' : 'Within range' });
+
+  atmo.push({ n:'Humidity trend', v: d.humidity > 85 ? 'Sustained high' : 'Normal' });
+  atmo.push({ n:'Temp–humidity coupling', v: (d.humidity > 85 && d.temperature < 26) ? 'Storm-consistent' : 'No signal' });
+  atmo.push({ n:'Sensor confidence', v: 'High' });
+
+  document.getElementById('markersLevel').innerHTML = level.map(m => `<li><span class="mname">${m.n}</span><span class="mval">${m.v}</span></li>`).join('');
+  document.getElementById('markersAtmo').innerHTML = atmo.map(m => `<li><span class="mname">${m.n}</span><span class="mval">${m.v}</span></li>`).join('');
+}
+
+function renderLevelChart(history){
+  const points = history.slice(-HISTORY_POINTS);
+  levelChart.data.labels = points.map(p => new Date(p.timestamp).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}));
+  levelChart.data.datasets[0].data = points.map(p => p.waterLevel);
+  levelChart.update();
+}
+
+/* ============================================================================
+   4. SIMULATION / FIREBASE WIRING
+   ============================================================================ */
+function rand(a,b){ return a + Math.random()*(b-a); }
+function clamp(v,a,b){ return Math.max(a, Math.min(b, v)); }
+function looksConfigured(cfg){ return cfg.apiKey && !cfg.apiKey.startsWith('YOUR_') && cfg.databaseURL && !cfg.databaseURL.includes('YOUR_PROJECT'); }
+
+function startSimulation(){
+  document.getElementById('simTag').style.display = 'inline-block';
+  const history = [];
+  simStep = function(){
+    const storm = Math.random() < 0.07;
+    const prevLevel = simState.waterLevel;
+    simState.waterLevel = clamp(simState.waterLevel + (storm ? rand(4,10) : rand(-1,1.2)), 2, 130);
+    simState.humidity = clamp(simState.humidity + (storm ? rand(3,8) : rand(-2,2)), 40, 99);
+    simState.temperature = clamp(simState.temperature + rand(-0.3,0.3), 22, 34);
+    const rateOfRise = (simState.waterLevel - prevLevel) * 20; // scale demo tick to cm/hr
+
+    const reading = { waterLevel: simState.waterLevel, rateOfRise: Math.max(0, rateOfRise), temperature: simState.temperature, humidity: simState.humidity, timestamp: Date.now() };
+    history.push(reading);
+    if (history.length > HISTORY_POINTS) history.shift();
+
+    render(reading);
+    renderLevelChart(history);
+  };
+  simStep();
+  simIntervalId = setInterval(simStep, 3000);
+}
+
+function startFirebase(){
+  try{
+    firebase.initializeApp(FIREBASE_CONFIG);
+    const db = firebase.database();
+    document.getElementById('simTag').style.display = 'none';
+
+    let lastLevel = null, lastTs = null;
+    db.ref('sensors/current').on('value', snap => {
+      const d = snap.val();
+      if (!d) return;
+      let rateOfRise = 0;
+      if (lastLevel !== null && lastTs !== null){
+        const hrs = (d.timestamp - lastTs) / 3600000;
+        if (hrs > 0) rateOfRise = Math.max(0, (d.waterLevel - lastLevel) / hrs);
+      }
+      lastLevel = d.waterLevel; lastTs = d.timestamp;
+      render({ ...d, rateOfRise });
+    }, err => { console.error('Firebase read failed, falling back to simulation:', err); startSimulation(); });
+
+    db.ref('sensors/history').limitToLast(HISTORY_POINTS).on('value', snap => {
+      const val = snap.val();
+      if (!val) return;
+      renderLevelChart(Object.values(val).sort((a,b) => a.timestamp - b.timestamp));
+    });
+  } catch(err){
+    console.error('Firebase init failed, running simulation instead:', err);
+    startSimulation();
+  }
+}
+
+if (looksConfigured(FIREBASE_CONFIG)) startFirebase(); else startSimulation();
+</script>
+</body>
+</html>
